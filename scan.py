@@ -3,6 +3,8 @@ from datetime import datetime, timedelta
 from scipy.interpolate import interp1d
 import numpy as np
 import requests
+import json
+import time
 
 
 def filterDates(dates):
@@ -41,7 +43,7 @@ def buildIVCurve(days, ivs):
     days, ivs = days[idx], ivs[idx]
     spline = interp1d(days, ivs, kind='linear', fill_value="extrapolate")
     def term_spline(dte):
-        if dte < days[0]:   return ivs[0]
+        if dte < days[0]:    return ivs[0]
         elif dte > days[-1]: return ivs[-1]
         else:                return float(spline(dte))
     return term_spline
@@ -59,11 +61,6 @@ def _emptyResult(error: str) -> dict:
 
 
 def isTickerEligible(tickers) -> dict:
-    """
-    Accepts either a single ticker string, a list, or a dict of tickers.
-    Returns a dict keyed by ticker with their eligibility results.
-    """
-    # normalize input to a list of tickers
     if isinstance(tickers, str):
         tickers = [tickers]
     elif isinstance(tickers, dict):
@@ -72,6 +69,7 @@ def isTickerEligible(tickers) -> dict:
     results = {}
 
     for ticker in tickers:
+        time.sleep(0.5)
         try:
             ticker = ticker.strip().upper()
             stock  = yf.Ticker(ticker)
@@ -89,6 +87,10 @@ def isTickerEligible(tickers) -> dict:
             options_chains   = {d: stock.option_chain(d) for d in exp_dates}
             price_history    = stock.history(period='3mo')
             underlying_price = price_history['Close'].iloc[-1]
+
+            if underlying_price < 10.0:
+                results[ticker] = _emptyResult(f"Underlying ${round(underlying_price, 2)} too low")
+                continue
 
             atm_iv   = {}
             straddle = None
@@ -162,64 +164,62 @@ def isTickerEligible(tickers) -> dict:
 
 
 def getEarningsTickers(date: str = None) -> list[str]:
-    """
-    Returns a list of tickers reporting earnings after market close (AMC).
-    date: 'YYYY-MM-DD' format, defaults to today if not provided
-    """
     if date is None:
         date = datetime.today().strftime("%Y-%m-%d")
-    
-    url = f"https://api.nasdaq.com/api/calendar/earnings?date={date}"
-    
-    headers = {
-        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept":          "application/json, text/plain, */*",
-        "Origin":          "https://www.nasdaq.com",
-        "Referer":         "https://www.nasdaq.com/",
-    }
 
-    try:
-        rows = requests.get(url, headers=headers).json().get("data", {}).get("rows", [])
-        return [r["symbol"] for r in rows if r.get("time", "").strip() == "time-after-hours"]
-    except Exception as e:
-        print(f"Error fetching earnings calendar: {e}")
-        return []
+    tomorrow = (datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
 
+    def fetchRows(fetch_date: str) -> list:
+        url     = "https://api.nasdaq.com/api/calendar/earnings"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept":     "application/json, text/plain, */*",
+            "Origin":     "https://www.nasdaq.com",
+            "Referer":    "https://www.nasdaq.com/",
+        }
+        all_rows = []
+        offset   = 0
+        limit    = 10
 
-def scanEarnings(date: str = None) -> dict:
-    tickers = getEarningsTickers(date)
+        try:
+            while True:
+                params   = {"date": fetch_date, "offset": offset, "limit": limit}
+                response = requests.get(url, headers=headers, params=params)
+                data     = response.json()
+                rows     = data.get("data", {}).get("rows", [])
+                total    = data.get("data", {}).get("totalrecords", 0)
 
-    if not tickers:
-        print("No AMC earnings found.")
-        return {}
+                if not rows:
+                    break
 
-    print(f"Scanning {len(tickers)} tickers reporting AMC...\n")
+                all_rows.extend(rows)
 
-    results = isTickerEligible(tickers)
+                if len(all_rows) >= int(total):
+                    break
 
-    recommended = {}
-    for ticker, result in results.items():
-        em    = result.get('expected_move') or 'N/A'
-        vol   = 'PASS' if result['avg_volume']   else 'FAIL'
-        iv    = 'PASS' if result['iv30_rv30']     else 'FAIL'
-        slope = 'PASS' if result['ts_slope_0_45'] else 'FAIL'
-        error = f" | ERR: {result['error']}"      if result['error'] else ''
+                offset += limit
 
-        print(f"{ticker:6} | {result['recommendation']:12} | EM: {em:>7} | Vol: {vol} | IV: {iv} | Slope: {slope}{error}")
+        except Exception as e:
+            print(f"Error fetching {fetch_date}: {e}")
 
-        if result['recommendation'] == 'Recommended':
-            recommended[ticker] = result
+        return all_rows
 
-    print(f"\n{len(recommended)} Recommended setup(s) found.")
-    return recommended
+    today_rows    = fetchRows(date)
+    tomorrow_rows = fetchRows(tomorrow)
+
+    amc_today    = [r["symbol"] for r in today_rows    if r.get("time", "").strip() == "time-after-hours"]
+    pre_tomorrow = [r["symbol"] for r in tomorrow_rows if r.get("time", "").strip() == "time-pre-market"]
+
+    all_tickers = list(dict.fromkeys(amc_today + pre_tomorrow))
+
+    print(f"Today AMC:           {len(amc_today)} tickers")
+    print(f"Tomorrow pre-market: {len(pre_tomorrow)} tickers")
+    print(f"Total unique:        {len(all_tickers)} tickers\n")
+
+    return all_tickers
 
 
 def getCalendarLegs(tickers) -> dict:
-    """
-    Accepts either a single ticker string, a list, or a dict of tickers.
-    Returns a dict keyed by ticker with their calendar spread legs.
-    """
-    # normalize input to a list of tickers
     if isinstance(tickers, str):
         tickers = [tickers]
     elif isinstance(tickers, dict):
@@ -228,6 +228,7 @@ def getCalendarLegs(tickers) -> dict:
     results = {}
 
     for ticker in tickers:
+        time.sleep(0.5)
         try:
             ticker = ticker.strip().upper()
             stock  = yf.Ticker(ticker)
@@ -303,5 +304,41 @@ def getCalendarLegs(tickers) -> dict:
 
     return results
 
-getCalendarLegs(scanEarnings())
-# next, choose strike price, name both options and place order.
+
+def scanEarnings(date: str = None) -> dict:
+    tickers = getEarningsTickers(date)
+
+    if not tickers:
+        print("No earnings found.")
+        return {}
+
+    print(f"Scanning {len(tickers)} tickers...\n")
+
+    results = isTickerEligible(tickers)
+
+    recommended = {}
+    for ticker, result in results.items():
+        em    = result.get('expected_move') or 'N/A'
+        vol   = 'PASS' if result['avg_volume']   else 'FAIL'
+        iv    = 'PASS' if result['iv30_rv30']     else 'FAIL'
+        slope = 'PASS' if result['ts_slope_0_45'] else 'FAIL'
+        error = f" | ERR: {result['error']}"      if result['error'] else ''
+
+        print(f"{ticker:6} | {result['recommendation']:12} | EM: {em:>7} | Vol: {vol} | IV: {iv} | Slope: {slope}{error}")
+
+        if result['recommendation'] == 'Recommended':
+            recommended[ticker] = result
+
+    print(f"\n{len(recommended)} Recommended setup(s) found.")
+    return recommended
+
+
+if __name__ == "__main__":
+    recommended = scanEarnings()
+    legs        = getCalendarLegs(recommended)
+
+    # save legs to file for entry.py to pick up
+    with open("legs.json", "w") as f:
+        json.dump(legs, f, indent=2)
+
+    print("\nLegs saved to legs.json")

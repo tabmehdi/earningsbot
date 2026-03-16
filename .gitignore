@@ -1,5 +1,8 @@
 # Files
 Transcripts.txt
+.gitignore
+.env
+legs.json
 
 # Python
 __pycache__/
