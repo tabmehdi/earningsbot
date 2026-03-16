@@ -61,6 +61,10 @@ def _emptyResult(error: str) -> dict:
 
 
 def isTickerEligible(tickers) -> dict:
+    """
+    Accepts either a single ticker string, a list, or a dict of tickers.
+    Returns a dict keyed by ticker with their eligibility results.
+    """
     if isinstance(tickers, str):
         tickers = [tickers]
     elif isinstance(tickers, dict):
@@ -68,11 +72,41 @@ def isTickerEligible(tickers) -> dict:
 
     results = {}
 
+    # batch download all price histories in one request
+    try:
+        all_history = yf.download(
+            tickers,
+            period            = '3mo',
+            group_by          = 'ticker',
+            auto_adjust       = True,
+            progress          = False,
+            threads           = False,   # sequential to avoid burst
+            multi_level_index = True
+        )
+    except Exception as e:
+        print(f"Batch download failed: {e}")
+        all_history = None
+
     for ticker in tickers:
-        time.sleep(0.5)
         try:
             ticker = ticker.strip().upper()
             stock  = yf.Ticker(ticker)
+
+            # get price history from batch download
+            try:
+                if all_history is None:
+                    raise Exception("Batch download unavailable")
+                price_history = all_history[ticker] if len(tickers) > 1 else all_history
+                if price_history.empty:
+                    raise Exception("Empty price history")
+            except Exception:
+                price_history = stock.history(period='3mo')
+
+            underlying_price = float(price_history['Close'].iloc[-1])
+
+            #if underlying_price < 10.0:
+            #    results[ticker] = _emptyResult(f"Underlying ${round(underlying_price, 2)} too low")
+            #    continue
 
             if not stock.options:
                 results[ticker] = _emptyResult(f"No options found for '{ticker}'")
@@ -84,13 +118,9 @@ def isTickerEligible(tickers) -> dict:
                 results[ticker] = _emptyResult("Not enough option data.")
                 continue
 
-            options_chains   = {d: stock.option_chain(d) for d in exp_dates}
-            price_history    = stock.history(period='3mo')
-            underlying_price = price_history['Close'].iloc[-1]
-
-            if underlying_price < 10.0:
-                results[ticker] = _emptyResult(f"Underlying ${round(underlying_price, 2)} too low")
-                continue
+            options_chains = {}
+            for d in exp_dates:
+                options_chains[d] = stock.option_chain(d)
 
             atm_iv   = {}
             straddle = None
@@ -332,13 +362,5 @@ def scanEarnings(date: str = None) -> dict:
     print(f"\n{len(recommended)} Recommended setup(s) found.")
     return recommended
 
+scanEarnings()
 
-if __name__ == "__main__":
-    recommended = scanEarnings()
-    legs        = getCalendarLegs(recommended)
-
-    # save legs to file for entry.py to pick up
-    with open("legs.json", "w") as f:
-        json.dump(legs, f, indent=2)
-
-    print("\nLegs saved to legs.json")
